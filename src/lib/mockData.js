@@ -6,6 +6,9 @@ export const defaultTradeProfile = {
   max_positions: 4,
   cash_reserve_percent: 30,
   mode: 'balanced',
+  goal_profit_amount: 150000,
+  current_profit_amount: 0,
+  goal_deadline: '',
   allow_fractional: true,
   allow_cash_stock: true,
   allow_margin: false,
@@ -16,6 +19,24 @@ export const defaultTradeProfile = {
   can_accept_futures_volatility: false,
   notes: ''
 };
+
+export const marketIndices = [
+  { group: '台股', items: [
+    { name: '加權指數', value: '42,580', change: '+0.82%', tone: 'green' },
+    { name: '櫃買指數', value: '246.3', change: '+0.64%', tone: 'green' },
+    { name: '台指近月', value: '42,710', change: '+0.77%', tone: 'green' },
+  ]},
+  { group: '美股', items: [
+    { name: '道瓊', value: '41,220', change: '+0.18%', tone: 'green' },
+    { name: 'S&P 500', value: '5,625', change: '+0.32%', tone: 'green' },
+    { name: 'NASDAQ', value: '18,420', change: '+0.55%', tone: 'green' },
+    { name: '費半 SOX', value: '5,180', change: '-0.21%', tone: 'red' },
+  ]},
+  { group: '亞洲', items: [
+    { name: '日經', value: '38,920', change: '+0.41%', tone: 'green' },
+    { name: '韓股 KOSPI', value: '2,781', change: '-0.11%', tone: 'red' },
+  ]}
+];
 
 export const sectors = [
   { name: '被動元件', score: 9.2, status: '主流', note: '領頭華新科，二線華容接力。' },
@@ -47,5 +68,5 @@ export const rules = [
   '槓桿不是用來賭方向，而是用在停損點很近時放大效率。',
   '權證先確認現股可買，再挑權證；-20% 停損，2～3 天不發動撤離。',
   '到第一波滿足、槓桿商品獲利 30%～50%、高檔震盪變大，善用一半。',
-  'AI 參考分析，人工確認後發布。AI 不覆蓋最高管理員與講義規則。'
+  'AI 僅提供參考分析草案，需由管理員或最高管理員確認後發布。'
 ];

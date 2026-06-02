@@ -15,8 +15,12 @@ export function roleLabel(role) {
   }[role] || '個人使用者';
 }
 
-export function canViewSensitive(role, currentUserId, targetUserId) {
-  return role === 'owner' || currentUserId === targetUserId;
+export function approvalLabel(status) {
+  return {
+    pending: '待審核',
+    approved: '已通過',
+    rejected: '已退回'
+  }[status] || '待審核';
 }
 
 export function supportBands(support) {
@@ -78,6 +82,13 @@ export function positionSizing(profile, setup) {
     futuresLossOneLot,
     futuresAllowed
   };
+}
+
+export function goalProgress(profile) {
+  const target = Number(profile?.goal_profit_amount || 0);
+  const current = Number(profile?.current_profit_amount || 0);
+  const pct = target > 0 ? Math.max(0, Math.min(100, (current / target) * 100)) : 0;
+  return { target, current, pct };
 }
 
 export function toolRecommendation(profile, symbol) {

@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { supabase, isSupabaseConfigured } from './lib/supabase.js';
-import { defaultTradeProfile, sectors, symbols, demoWarrants, rules } from './lib/mockData.js';
-import { OWNER_EMAIL, normalizeRole, roleLabel, supportBands, pctFromSupport, entryStatus, positionSizing, toolRecommendation, formatMoney, formatPrice, warrantScore } from './lib/tradeLogic.js';
+import { defaultTradeProfile, demoWarrants, marketIndices, rules, sectors, symbols } from './lib/mockData.js';
+import { OWNER_EMAIL, approvalLabel, entryStatus, formatMoney, formatPrice, goalProgress, normalizeRole, pctFromSupport, positionSizing, roleLabel, supportBands, toolRecommendation, warrantScore } from './lib/tradeLogic.js';
 import './styles.css';
 
 const pages = [
@@ -12,7 +12,7 @@ const pages = [
   { id: 'tools', label: '標的工具箱', icon: '🧰' },
   { id: 'warrants', label: '權證候選搜尋', icon: '🎯' },
   { id: 'report', label: 'AI 盤後分析', icon: '📝' },
-  { id: 'admin', label: '管理員設定', icon: '⚙️' }
+  { id: 'admin', label: '審核與管理', icon: '⚙️' }
 ];
 
 function App() {
@@ -26,6 +26,7 @@ function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [aiReport, setAiReport] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
+  const [adminUsers, setAdminUsers] = useState([]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -56,6 +57,10 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (page === 'admin' && supabase && role === 'owner') fetchAdminUsers();
+  }, [page, session?.user?.id]);
+
   async function hydrateUser(user) {
     if (!user || !supabase) {
       setProfile(null);
@@ -68,7 +73,12 @@ function App() {
       email,
       display_name: user.user_metadata?.full_name || user.user_metadata?.name || email.split('@')[0],
       avatar_url: user.user_metadata?.avatar_url,
-      role: email === OWNER_EMAIL ? 'owner' : 'personal'
+      role: email === OWNER_EMAIL ? 'owner' : 'personal',
+      access_status: email === OWNER_EMAIL ? 'approved' : 'pending',
+      real_name: '',
+      nickname: '',
+      application_submitted_at: null,
+      approved_at: null
     };
 
     const { data: existingProfile } = await supabase.from('profiles').select('*').eq('id', user.id).maybeSingle();
@@ -78,22 +88,30 @@ function App() {
     const { data: refreshedProfile } = await supabase.from('profiles').select('*').eq('id', user.id).maybeSingle();
     const finalProfile = refreshedProfile || fallbackProfile;
     finalProfile.role = normalizeRole(finalProfile, email);
+    if (finalProfile.role === 'owner' && !finalProfile.access_status) finalProfile.access_status = 'approved';
     setProfile(finalProfile);
 
     const { data: trade } = await supabase.from('personal_trade_profiles').select('*').eq('user_id', user.id).maybeSingle();
-    setTradeProfile(trade || defaultTradeProfile);
+    setTradeProfile({ ...defaultTradeProfile, ...(trade || {}) });
+  }
+
+  async function fetchAdminUsers() {
+    const { data: profileRows } = await supabase.from('profiles').select('*').order('created_at', { ascending: false });
+    const { data: tradeRows } = await supabase.from('personal_trade_profiles').select('*');
+    const tradeMap = new Map((tradeRows || []).map(row => [row.user_id, row]));
+    setAdminUsers((profileRows || []).map(row => ({ ...row, tradeProfile: tradeMap.get(row.id) || null })));
   }
 
   const role = normalizeRole(profile, session?.user?.email);
   const isOwner = role === 'owner';
   const isAdminLike = role === 'owner' || role === 'admin';
+  const approvalStatus = isOwner ? 'approved' : (profile?.access_status || 'pending');
+  const onboardingComplete = Boolean(profile?.real_name) && Boolean(profile?.nickname) && Number(tradeProfile?.capital_amount || 0) > 0;
+  const canEnterSystem = isOwner ? onboardingComplete : (onboardingComplete && approvalStatus === 'approved');
 
   async function loginWithGoogle() {
     if (!supabase) return alert('尚未設定 Supabase 環境變數。請先在 Vercel 設定 VITE_SUPABASE_URL 與 VITE_SUPABASE_PUBLISHABLE_KEY。');
-    await supabase.auth.signInWithOAuth({
-      provider: 'google',
-      options: { redirectTo: window.location.origin }
-    });
+    await supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.origin } });
   }
 
   async function logout() {
@@ -101,6 +119,8 @@ function App() {
     await supabase.auth.signOut();
     setSession(null);
     setProfile(null);
+    setTradeProfile(defaultTradeProfile);
+    setPage('dashboard');
   }
 
   async function saveTradeProfile(nextProfile) {
@@ -110,6 +130,7 @@ function App() {
       return;
     }
     const payload = {
+      ...defaultTradeProfile,
       ...nextProfile,
       user_id: session.user.id,
       capital_amount: Number(nextProfile.capital_amount || 0),
@@ -117,11 +138,44 @@ function App() {
       monthly_target_percent: Number(nextProfile.monthly_target_percent || 0),
       max_daily_drawdown_percent: Number(nextProfile.max_daily_drawdown_percent || 0),
       max_positions: Number(nextProfile.max_positions || 1),
-      cash_reserve_percent: Number(nextProfile.cash_reserve_percent || 0)
+      cash_reserve_percent: Number(nextProfile.cash_reserve_percent || 0),
+      goal_profit_amount: Number(nextProfile.goal_profit_amount || 0),
+      current_profit_amount: Number(nextProfile.current_profit_amount || 0),
+      goal_deadline: nextProfile.goal_deadline || null,
     };
     const { error } = await supabase.from('personal_trade_profiles').upsert(payload, { onConflict: 'user_id' });
     if (error) alert(`儲存失敗：${error.message}`);
     else alert('個人交易設定已儲存。');
+  }
+
+  async function submitOnboarding(formProfile, formTradeProfile) {
+    if (!session?.user || !supabase) return;
+    const accessStatus = isOwner ? 'approved' : 'pending';
+    const profilePayload = {
+      id: session.user.id,
+      email: (session.user.email || '').toLowerCase(),
+      display_name: formProfile.nickname,
+      real_name: formProfile.real_name,
+      nickname: formProfile.nickname,
+      avatar_url: session.user.user_metadata?.avatar_url || null,
+      role: role,
+      access_status: accessStatus,
+      application_submitted_at: new Date().toISOString(),
+      approved_at: isOwner ? new Date().toISOString() : null,
+      updated_at: new Date().toISOString()
+    };
+    const { error: profileError } = await supabase.from('profiles').upsert(profilePayload, { onConflict: 'id' });
+    if (profileError) return alert(`儲存基本資料失敗：${profileError.message}`);
+    await saveTradeProfile(formTradeProfile);
+    await hydrateUser(session.user);
+    if (!isOwner) alert('申請資料已送出，請等待最高管理員審核後進入系統。');
+  }
+
+  async function updateApproval(userId, nextStatus) {
+    const patch = { access_status: nextStatus, approved_at: nextStatus === 'approved' ? new Date().toISOString() : null };
+    const { error } = await supabase.from('profiles').update(patch).eq('id', userId);
+    if (error) alert(`更新失敗：${error.message}`);
+    else fetchAdminUsers();
   }
 
   function go(pageId) {
@@ -137,20 +191,13 @@ function App() {
       const resp = await fetch('/api/ai-reference', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          role,
-          tradeProfile,
-          selectedSymbol,
-          sectors,
-          symbols,
-          rules
-        })
+        body: JSON.stringify({ role, tradeProfile, selectedSymbol, sectors, symbols, rules })
       });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || 'AI 分析產生失敗');
       setAiReport(data.text);
-    } catch (err) {
-      setAiReport(`無法連接 AI API，目前顯示 Demo 參考分析：\n\n${buildFallbackReport(selectedSymbol, tradeProfile)}`);
+    } catch (_err) {
+      setAiReport(buildFallbackReport(selectedSymbol, tradeProfile));
     } finally {
       setAiLoading(false);
     }
@@ -159,6 +206,18 @@ function App() {
   const pageTitle = pages.find(p => p.id === page)?.label || '總覽儀表板';
 
   if (loading) return <div className="boot">系統載入中...</div>;
+
+  if (!session) {
+    return <AuthGate loginWithGoogle={loginWithGoogle} />;
+  }
+
+  if (!onboardingComplete) {
+    return <OnboardingGate session={session} profile={profile} tradeProfile={tradeProfile} onSubmit={submitOnboarding} onLogout={logout} />;
+  }
+
+  if (!canEnterSystem) {
+    return <PendingGate profile={profile} logout={logout} isOwner={isOwner} />;
+  }
 
   return (
     <div className="app-shell">
@@ -179,34 +238,135 @@ function App() {
         <div className="nav-footer">
           <div className="role-card">
             <span className={`badge ${role}`}>{roleLabel(role)}</span>
-            <small>{profile?.email || '尚未登入'}</small>
+            <small>{profile?.nickname || profile?.display_name || profile?.email}</small>
+            <small className="muted-line">{approvalLabel(approvalStatus)}</small>
           </div>
+          <button className="small-btn full" onClick={logout}>登出</button>
         </div>
       </aside>
 
       <main className="main">
         <header className="topbar">
           <button className="icon-btn" onClick={() => setDrawerOpen(!drawerOpen)}>☰</button>
-          <div className="title-block">
+          <div className="title-block compact">
             <h1>{pageTitle}</h1>
-            <p>AI 參考分析，人工確認後發布</p>
+            <p>AI 參考分析需人工確認後發布</p>
           </div>
           <button className="small-btn" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? '🌙' : '☀️'}</button>
-          {session ? <button className="small-btn" onClick={logout}>登出</button> : <button className="primary-btn" onClick={loginWithGoogle}>Google 登入</button>}
         </header>
 
         <section className="content">
           {!isSupabaseConfigured && <Notice type="warn" title="尚未連接 Supabase" text="目前為 Demo 模式。上傳 Vercel 並設定環境變數後，即可使用 Google 登入與資料庫儲存。" />}
-          {page === 'dashboard' && <Dashboard go={go} tradeProfile={tradeProfile} selectedSymbol={selectedSymbol} setSelectedSymbol={setSelectedSymbol} isOwner={isOwner} />}
+          {page === 'dashboard' && <Dashboard go={go} tradeProfile={tradeProfile} selectedSymbol={selectedSymbol} setSelectedSymbol={setSelectedSymbol} isOwner={isOwner} profile={profile} />}
           {page === 'profile' && <ProfilePage profile={profile} role={role} tradeProfile={tradeProfile} saveTradeProfile={saveTradeProfile} isOwner={isOwner} session={session} />}
           {page === 'core' && <CoreLogicPage />}
           {page === 'tools' && <ToolsPage tradeProfile={tradeProfile} selectedSymbol={selectedSymbol} setSelectedSymbol={setSelectedSymbol} />}
           {page === 'warrants' && <WarrantsPage selectedSymbol={selectedSymbol} setSelectedSymbol={setSelectedSymbol} />}
           {page === 'report' && <ReportPage generateAiReport={generateAiReport} aiReport={aiReport} aiLoading={aiLoading} selectedSymbol={selectedSymbol} />}
-          {page === 'admin' && <AdminPage role={role} isAdminLike={isAdminLike} isOwner={isOwner} />}
+          {page === 'admin' && <AdminPage role={role} isAdminLike={isAdminLike} isOwner={isOwner} users={adminUsers} updateApproval={updateApproval} />}
           {page !== 'dashboard' && <BackHome go={go} />}
         </section>
       </main>
+    </div>
+  );
+}
+
+function AuthGate({ loginWithGoogle }) {
+  return (
+    <div className="gate-shell">
+      <div className="gate-card large">
+        <span className="eyebrow">登入後才可使用</span>
+        <h1>台股 AI 智慧監控</h1>
+        <p>先使用 Google 登入。第一次登入會立即進入資料填寫頁，包含本名、稱呼、可操作本金、風險承受度與獲利目標。資料送出並通過最高管理員審核後，才可進入完整系統。</p>
+        <div className="rule-grid soft compact-grid">
+          <div>1. Google 登入</div>
+          <div>2. 首次填寫個人資料</div>
+          <div>3. 最高管理員審核</div>
+          <div>4. 通過後進入系統</div>
+        </div>
+        <button className="primary-btn wide" onClick={loginWithGoogle}>使用 Google 登入</button>
+      </div>
+    </div>
+  );
+}
+
+function OnboardingGate({ session, profile, tradeProfile, onSubmit, onLogout }) {
+  const [formProfile, setFormProfile] = useState({
+    real_name: profile?.real_name || '',
+    nickname: profile?.nickname || profile?.display_name || ''
+  });
+  const [formTrade, setFormTrade] = useState({ ...defaultTradeProfile, ...tradeProfile, goal_deadline: tradeProfile?.goal_deadline || '' });
+
+  const updateP = (key, value) => setFormProfile(prev => ({ ...prev, [key]: value }));
+  const updateT = (key, value) => setFormTrade(prev => ({ ...prev, [key]: value }));
+  const bool = key => Boolean(formTrade[key]);
+
+  return (
+    <div className="gate-shell">
+      <div className="gate-card form-card">
+        <div className="gate-topbar">
+          <div>
+            <span className="eyebrow">首次登入必填</span>
+            <h1>建立個人交易檔案</h1>
+            <p>{session?.user?.email} 已登入。請先完成以下資料，送出後才可進入系統。</p>
+          </div>
+          <button className="small-btn" onClick={onLogout}>登出</button>
+        </div>
+
+        <div className="card in-gate">
+          <div className="card-head"><h3>基本身分資料</h3></div>
+          <div className="form-grid">
+            <Field label="本名（必填）"><input value={formProfile.real_name} onChange={e => updateP('real_name', e.target.value)} placeholder="請填寫本名" /></Field>
+            <Field label="希望被稱呼的名字 / 綽號（必填）"><input value={formProfile.nickname} onChange={e => updateP('nickname', e.target.value)} placeholder="例如：Jason" /></Field>
+          </div>
+        </div>
+
+        <div className="card in-gate">
+          <div className="card-head"><h3>交易與風險設定</h3></div>
+          <div className="form-grid">
+            <Field label="可操作本金"><input type="number" value={formTrade.capital_amount} onChange={e => updateT('capital_amount', e.target.value)} /></Field>
+            <Field label="單筆最大虧損 %"><input type="number" step="0.1" value={formTrade.max_risk_percent} onChange={e => updateT('max_risk_percent', e.target.value)} /></Field>
+            <Field label="每月目標報酬 %"><input type="number" step="0.1" value={formTrade.monthly_target_percent} onChange={e => updateT('monthly_target_percent', e.target.value)} /></Field>
+            <Field label="單日心理承受虧損 %"><input type="number" step="0.1" value={formTrade.max_daily_drawdown_percent} onChange={e => updateT('max_daily_drawdown_percent', e.target.value)} /></Field>
+            <Field label="最大同時持倉"><input type="number" value={formTrade.max_positions} onChange={e => updateT('max_positions', e.target.value)} /></Field>
+            <Field label="保留現金比例 %"><input type="number" step="1" value={formTrade.cash_reserve_percent} onChange={e => updateT('cash_reserve_percent', e.target.value)} /></Field>
+            <Field label="預期達成獲利目標金額"><input type="number" value={formTrade.goal_profit_amount} onChange={e => updateT('goal_profit_amount', e.target.value)} /></Field>
+            <Field label="目前已達成獲利（可先填 0）"><input type="number" value={formTrade.current_profit_amount} onChange={e => updateT('current_profit_amount', e.target.value)} /></Field>
+            <Field label="目標完成日期"><input type="date" value={formTrade.goal_deadline || ''} onChange={e => updateT('goal_deadline', e.target.value)} /></Field>
+            <Field label="交易模式"><select value={formTrade.mode} onChange={e => updateT('mode', e.target.value)}><option value="conservative">保守</option><option value="balanced">平衡</option><option value="aggressive">積極</option><option value="learning">學習</option></select></Field>
+          </div>
+
+          <h4>商品偏好</h4>
+          <div className="check-grid">
+            {[
+              ['allow_fractional', '零股'], ['allow_cash_stock', '現股'], ['allow_margin', '融資'], ['allow_stock_futures', '股票期貨'], ['allow_warrants', '權證'], ['allow_options', '選擇權'], ['can_follow_20pct_warrant_stop', '可執行權證 -20% 停損'], ['can_accept_futures_volatility', '可承受股期波動']
+            ].map(([key, label]) => <label key={key} className="check"><input type="checkbox" checked={bool(key)} onChange={e => updateT(key, e.target.checked)} />{label}</label>)}
+          </div>
+          <Field label="補充說明"><textarea rows="3" value={formTrade.notes || ''} onChange={e => updateT('notes', e.target.value)} placeholder="例如：目前主要以現股為主，權證只做主流股。" /></Field>
+        </div>
+
+        <button
+          className="primary-btn wide"
+          onClick={() => onSubmit(formProfile, formTrade)}
+          disabled={!formProfile.real_name || !formProfile.nickname || !Number(formTrade.capital_amount || 0)}
+        >
+          送出首次申請資料
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PendingGate({ profile, logout, isOwner }) {
+  return (
+    <div className="gate-shell">
+      <div className="gate-card pending-card">
+        <span className="eyebrow">審核中</span>
+        <h1>{isOwner ? '請先完成資料建立' : '你的帳號正在等待審核'}</h1>
+        <p>稱呼：{profile?.nickname || profile?.display_name || '未填寫'}／狀態：{approvalLabel(profile?.access_status || 'pending')}</p>
+        <p>目前尚未開放進入系統主頁。最高管理員通過後，你即可使用完整功能。</p>
+        <button className="secondary-btn wide" onClick={logout}>登出</button>
+      </div>
     </div>
   );
 }
@@ -215,33 +375,61 @@ function Notice({ type = 'info', title, text }) {
   return <div className={`notice ${type}`}><b>{title}</b><span>{text}</span></div>;
 }
 
-function Dashboard({ go, tradeProfile, selectedSymbol, setSelectedSymbol, isOwner }) {
+function Dashboard({ go, tradeProfile, selectedSymbol, setSelectedSymbol, isOwner, profile }) {
   const risk = positionSizing(tradeProfile, selectedSymbol);
+  const goal = goalProgress(tradeProfile);
+  const statusCards = [
+    { label: '大盤狀態', value: '多方未破撐', tone: 'green' },
+    { label: '主流', value: '被動元件 / 分離元件', tone: 'blue' },
+    { label: '最高規則', value: '趨勢最大，點位次之', tone: 'yellow' },
+    { label: 'AI 狀態', value: '參考分析待確認', tone: 'purple' }
+  ];
+  const personalCards = [
+    { label: '目標達成度', value: `${goal.pct.toFixed(0)}%`, hint: `目前 $${formatMoney(goal.current)} / 目標 $${formatMoney(goal.target)}`, tone: 'green' },
+    { label: '可操作本金', value: `$${formatMoney(tradeProfile.capital_amount)}`, hint: isOwner ? '最高管理員可看全部個人敏感資料' : '僅本人與最高管理員可看', tone: 'blue' },
+    { label: '單筆最大風險', value: `$${formatMoney(risk.singleRisk)}`, hint: `${tradeProfile.max_risk_percent}% 風險模型`, tone: 'yellow' },
+    { label: '權證投入上限', value: `$${formatMoney(risk.warrantBudget)}`, hint: '以 -20% 停損反推', tone: 'red' },
+    { label: '選擇權權利金上限', value: `$${formatMoney(risk.optionPremiumBudget)}`, hint: '限買方 / 價差單', tone: 'purple' }
+  ];
+
   return (
     <div className="grid-flow">
-      <div className="ticker-row">
-        <Ticker label="大盤狀態" value="多方未破撐" tone="green" />
-        <Ticker label="主流" value="被動元件 / 分離元件" tone="blue" />
-        <Ticker label="最高規則" value="趨勢最大，點位次之" tone="yellow" />
-        <Ticker label="AI 狀態" value="參考分析待確認" tone="purple" />
-      </div>
-      <div className="card hero-card">
+      <div className="card hero-card compact-hero">
         <div>
-          <span className="eyebrow">正式 V1 核心</span>
-          <h2>大盤 → 主流 → 個股 → 買點 → 商品 → 風控</h2>
-          <p>本系統先用風大 × 浪跡邏輯過濾市場，再依個人資金與心理承受度計算可投入上限。AI 只負責整理與產生參考分析，人工確認後才發布。</p>
+          <span className="eyebrow">歡迎回來</span>
+          <h2>{profile?.nickname || profile?.display_name || profile?.email}</h2>
+          <p>正式 V1 核心：大盤 → 主流 → 個股 → 買點 → 商品 → 風控。先判斷市場，再依個人資金與心理承受度配置商品。</p>
         </div>
-        <div className="hero-actions">
+        <div className="hero-actions stacked-mobile">
           <button className="primary-btn" onClick={() => go('tools')}>開啟標的工具箱</button>
-          <button className="secondary-btn" onClick={() => go('profile')}>設定個人交易檔</button>
+          <button className="secondary-btn" onClick={() => go('profile')}>調整個人設定</button>
         </div>
       </div>
-      <div className="kpi-grid">
-        <Kpi label="可操作本金" value={isOwner ? `$${formatMoney(tradeProfile.capital_amount)}` : '本人可見'} hint="最高管理員可看全部個人敏感資料" tone="blue" />
-        <Kpi label="單筆最大風險" value={`$${formatMoney(risk.singleRisk)}`} hint={`${tradeProfile.max_risk_percent}% 風險模型`} tone="yellow" />
-        <Kpi label="權證投入上限" value={`$${formatMoney(risk.warrantBudget)}`} hint="以 -20% 停損反推" tone="red" />
-        <Kpi label="選擇權權利金上限" value={`$${formatMoney(risk.optionPremiumBudget)}`} hint="限買方 / 價差單" tone="purple" />
-      </div>
+
+      <Card title="全球指數快覽" right={<span className="pill blue">橫向滑動</span>}>
+        {marketIndices.map(group => (
+          <div key={group.group} className="section-block">
+            <div className="section-title">{group.group}</div>
+            <div className="h-scroll">
+              {group.items.map(item => <MarketChip key={item.name} item={item} />)}
+            </div>
+          </div>
+        ))}
+      </Card>
+
+      <Card title="盤面判斷與系統狀態" right={<span className="pill purple">橫向滑動</span>}>
+        <div className="h-scroll">
+          {statusCards.map(card => <Ticker key={card.label} label={card.label} value={card.value} tone={card.tone} />)}
+        </div>
+      </Card>
+
+      <Card title="個人目標與風險總覽" right={<span className="pill yellow">橫向滑動</span>}>
+        <ProgressBlock goal={goal} deadline={tradeProfile.goal_deadline} />
+        <div className="h-scroll space-top">
+          {personalCards.map(card => <Kpi key={card.label} label={card.label} value={card.value} hint={card.hint} tone={card.tone} />)}
+        </div>
+      </Card>
+
       <div className="two-col">
         <Card title="主流族群排行">
           {sectors.map(s => <SectorRow key={s.name} sector={s} />)}
@@ -256,8 +444,30 @@ function Dashboard({ go, tradeProfile, selectedSymbol, setSelectedSymbol, isOwne
   );
 }
 
+function MarketChip({ item }) {
+  return <div className={`market-chip ${item.tone}`}><small>{item.name}</small><b>{item.value}</b><span>{item.change}</span></div>;
+}
+
 function Ticker({ label, value, tone }) {
   return <div className={`ticker ${tone}`}><small>{label}</small><b>{value}</b></div>;
+}
+
+function ProgressBlock({ goal, deadline }) {
+  return (
+    <div className="progress-card">
+      <div className="progress-top">
+        <div>
+          <small>目前目標進度</small>
+          <strong>{goal.pct.toFixed(0)}%</strong>
+        </div>
+        <div className="align-right">
+          <small>目標完成日</small>
+          <strong>{deadline || '尚未設定'}</strong>
+        </div>
+      </div>
+      <div className="progress-bar"><span style={{ width: `${goal.pct}%` }} /></div>
+    </div>
+  );
 }
 
 function Kpi({ label, value, hint, tone }) {
@@ -281,6 +491,7 @@ function ProfilePage({ profile, role, tradeProfile, saveTradeProfile, isOwner, s
   const [form, setForm] = useState(tradeProfile);
   useEffect(() => setForm(tradeProfile), [tradeProfile]);
   const sizing = positionSizing(form, symbols[0]);
+  const goal = goalProgress(form);
   const update = (key, value) => setForm(prev => ({ ...prev, [key]: value }));
   const bool = key => Boolean(form[key]);
 
@@ -290,6 +501,8 @@ function ProfilePage({ profile, role, tradeProfile, saveTradeProfile, isOwner, s
       <div className="two-col">
         <Card title="登入與角色">
           <div className="info-list">
+            <Info label="本名" value={profile?.real_name || '未填寫'} />
+            <Info label="希望稱呼" value={profile?.nickname || profile?.display_name || '未填寫'} />
             <Info label="目前帳號" value={profile?.email || '尚未登入'} />
             <Info label="目前角色" value={roleLabel(role)} />
             <Info label="最高管理員" value={OWNER_EMAIL} />
@@ -297,8 +510,9 @@ function ProfilePage({ profile, role, tradeProfile, saveTradeProfile, isOwner, s
           </div>
           {!session && <Notice type="warn" title="尚未登入" text="正式儲存個人設定前，請先使用 Google 登入。" />}
         </Card>
-        <Card title="風險試算結果">
+        <Card title="目標與風險試算結果">
           <div className="info-list">
+            <Info label="目標達成度" value={`${goal.pct.toFixed(0)}%`} />
             <Info label="單筆最大可虧損" value={`$${formatMoney(sizing.singleRisk)}`} />
             <Info label="權證建議投入上限" value={`$${formatMoney(sizing.warrantBudget)}`} />
             <Info label="選擇權權利金上限" value={`$${formatMoney(sizing.optionPremiumBudget)}`} />
@@ -306,7 +520,7 @@ function ProfilePage({ profile, role, tradeProfile, saveTradeProfile, isOwner, s
           </div>
         </Card>
       </div>
-      <Card title="首次設定 / 個人交易設定檔">
+      <Card title="個人交易設定檔">
         <div className="form-grid">
           <Field label="可操作本金"><input type="number" value={form.capital_amount} onChange={e => update('capital_amount', e.target.value)} /></Field>
           <Field label="單筆最大虧損 %"><input type="number" step="0.1" value={form.max_risk_percent} onChange={e => update('max_risk_percent', e.target.value)} /></Field>
@@ -314,6 +528,9 @@ function ProfilePage({ profile, role, tradeProfile, saveTradeProfile, isOwner, s
           <Field label="單日心理承受虧損 %"><input type="number" step="0.1" value={form.max_daily_drawdown_percent} onChange={e => update('max_daily_drawdown_percent', e.target.value)} /></Field>
           <Field label="最大同時持倉"><input type="number" value={form.max_positions} onChange={e => update('max_positions', e.target.value)} /></Field>
           <Field label="保留現金比例 %"><input type="number" step="1" value={form.cash_reserve_percent} onChange={e => update('cash_reserve_percent', e.target.value)} /></Field>
+          <Field label="預期達成獲利目標金額"><input type="number" value={form.goal_profit_amount || 0} onChange={e => update('goal_profit_amount', e.target.value)} /></Field>
+          <Field label="目前已達成獲利"><input type="number" value={form.current_profit_amount || 0} onChange={e => update('current_profit_amount', e.target.value)} /></Field>
+          <Field label="目標完成日期"><input type="date" value={form.goal_deadline || ''} onChange={e => update('goal_deadline', e.target.value)} /></Field>
           <Field label="交易模式"><select value={form.mode} onChange={e => update('mode', e.target.value)}><option value="conservative">保守</option><option value="balanced">平衡</option><option value="aggressive">積極</option><option value="learning">學習</option></select></Field>
         </div>
         <h4>商品偏好</h4>
@@ -322,6 +539,7 @@ function ProfilePage({ profile, role, tradeProfile, saveTradeProfile, isOwner, s
             ['allow_fractional', '零股'], ['allow_cash_stock', '現股'], ['allow_margin', '融資'], ['allow_stock_futures', '股票期貨'], ['allow_warrants', '權證'], ['allow_options', '選擇權'], ['can_follow_20pct_warrant_stop', '可執行權證 -20% 停損'], ['can_accept_futures_volatility', '可承受股期波動']
           ].map(([key, label]) => <label key={key} className="check"><input type="checkbox" checked={bool(key)} onChange={e => update(key, e.target.checked)} />{label}</label>)}
         </div>
+        <Field label="補充說明"><textarea rows="3" value={form.notes || ''} onChange={e => update('notes', e.target.value)} /></Field>
         <button className="primary-btn" onClick={() => saveTradeProfile(form)}>儲存個人交易設定</button>
       </Card>
     </div>
@@ -454,18 +672,38 @@ function ReportPage({ generateAiReport, aiReport, aiLoading, selectedSymbol }) {
   );
 }
 
-function AdminPage({ role, isAdminLike, isOwner }) {
+function AdminPage({ role, isAdminLike, isOwner, users, updateApproval }) {
   return (
     <div className="grid-flow">
       <Notice type={isOwner ? 'info' : 'warn'} title="最高管理員寫死" text={`最高管理員固定為 ${OWNER_EMAIL}，不可由一般 UI 變更。`} />
       <Card title="權限矩陣">
         <div className="permission-table">
-          <div><b>最高管理員</b><span>看所有個人敏感資料、調整角色、發布策略、管理規則。</span></div>
+          <div><b>最高管理員</b><span>看所有個人敏感資料、審核新使用者、調整角色、發布策略、管理規則。</span></div>
           <div><b>管理員</b><span>可確認 AI 參考分析與公開圖層，但不可看個人本金與心理承受度。</span></div>
           <div><b>個人使用者</b><span>查看公開分析、保存自己的交易設定、私有圖層與觀察筆記。</span></div>
           <div><b>閱覽者</b><span>只能看公開圖層、公開警示與已發布日報。</span></div>
         </div>
       </Card>
+      {isOwner && (
+        <Card title="新申請使用者審核">
+          <div className="review-list">
+            {users.filter(u => u.role !== 'owner').map(user => (
+              <div key={user.id} className="review-row">
+                <div>
+                  <b>{user.real_name || '未填本名'} / {user.nickname || user.display_name || '未填稱呼'}</b>
+                  <span>{user.email}</span>
+                  <small>狀態：{approvalLabel(user.access_status || 'pending')}｜本金：{user.tradeProfile ? `$${formatMoney(user.tradeProfile.capital_amount)}` : '未填寫'}</small>
+                </div>
+                <div className="review-actions">
+                  <button className="small-btn" onClick={() => updateApproval(user.id, 'approved')}>核准</button>
+                  <button className="small-btn danger" onClick={() => updateApproval(user.id, 'rejected')}>退回</button>
+                </div>
+              </div>
+            ))}
+            {users.filter(u => u.role !== 'owner').length === 0 && <div className="empty-text">目前沒有待審核資料。</div>}
+          </div>
+        </Card>
+      )}
       <Card title="正式後端服務拆分">
         <div className="rule-grid"><div>market-worker：盤中輪詢與資料更新</div><div>pattern-engine：型態辨識與滿足目標</div><div>alert-engine：去重、冷卻、分級通知</div><div>line-gateway：LINE Messaging API 對接</div><div>report-worker：盤後日報輸出</div><div>ai-evaluator：命中率與修正差異追蹤</div></div>
       </Card>
@@ -481,7 +719,7 @@ function BackHome({ go }) {
 function buildFallbackReport(sym, tradeProfile) {
   const status = entryStatus(sym.price, sym.support, sym.breakout);
   const sizing = positionSizing(tradeProfile, sym);
-  return `【${sym.symbol} ${sym.name}】AI 參考分析，人工確認後發布\n\n1. 大盤與主流：先確認大盤未破關鍵支撐，且 ${sym.sector} 仍屬主流或準主流。\n2. 買點：目前 ${status.label}。\n3. 支撐：${formatPrice(sym.support)}，停損：${formatPrice(sym.stop)}，第一滿足：${formatPrice(sym.target1)}。\n4. 資金：依你的設定，單筆最大風險約 $${formatMoney(sizing.singleRisk)}。\n5. 權證：若使用權證，投入上限約 $${formatMoney(sizing.warrantBudget)}，-20% 必須停損，2～3 天不發動撤離。\n6. 結論：符合低風險買點才出手；若離支撐過遠，不追高。`;
+  return `【${sym.symbol} ${sym.name}】AI 參考分析（本頁為示意草案，需人工確認）\n\n1. 大盤與主流：先確認大盤未破關鍵支撐，且 ${sym.sector} 仍屬主流或準主流。\n2. 買點：目前 ${status.label}。\n3. 支撐：${formatPrice(sym.support)}，停損：${formatPrice(sym.stop)}，第一滿足：${formatPrice(sym.target1)}。\n4. 資金：依你的設定，單筆最大風險約 $${formatMoney(sizing.singleRisk)}。\n5. 權證：若使用權證，投入上限約 $${formatMoney(sizing.warrantBudget)}，-20% 必須停損，2～3 天不發動撤離。\n6. 結論：符合低風險買點才出手；若離支撐過遠，不追高。`;
 }
 
 createRoot(document.getElementById('root')).render(<App />);
